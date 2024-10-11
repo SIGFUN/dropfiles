@@ -1,0 +1,31 @@
+#!/bin/bash -O extglob
+
+function __hook()
+{
+	local new_commits=()
+	local new_commits_uniq=()
+
+	while IFS= read -r l; do
+		local old="$(echo "$l" | cut -d ' ' -f1)"
+		local new="$(echo "$l" | cut -d ' ' -f2)"
+
+		# Record all the new commits.
+		new_commits+=("$new")
+	done
+
+	# Since multiple old commits can be represented by the same new commit (e.g.
+	# due to a squash), we have to unique the list of new commits. The new
+	# commits should already be sorted properly, i.e. we should not expect the
+	# same new commit to be referenced on disjointed lines of input.
+	new_commits_uniq=($(echo "${new_commits[*]}" | uniq))
+
+	# Start over from just before the first new commit.
+	git reset --hard "${new_commits_uniq[0]}"~
+
+	for new in "${new_commits_uniq[@]}"; do
+		# The cherry-pick command will run the prepare-commit-msg hook.
+		git cherry-pick "$new"
+	done
+}
+
+__hook "$@"

@@ -1,0 +1,182 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/GitHubQL.sh"
+. "${libdir}/Plist.sh"
+. "${libdir}/Keychain.sh"
+
+# Parsed options
+GIT_PARSEOPT_SPEC="\
+ghq [options] GRAPHQL-QUERY
+
+Queries GitHub with GRAPHQL-QUERY and prints the resulting JSON response. \
+There is basic pagination support which assumes that the paginated results are \
+returned in an array. I don't know whether this is always true for GraphQL, \
+but it seems to be sufficient for my purposes.
+
+$(CLI.get_stuckopt_blurb)
+--
+ Mutually exclusive options
+t,personal-access-token=TOKEN           Use TOKEN when authenticating to the \
+GraphQL endpoint
+
+k,token-keychain-identifier=IDENTIFIER  Find the PAT to authenticate with in \
+the Keychain using IDENTIFIER. They Keychain entry will be prefixed with \
+'com.github.pat.', so a single word IDENTIFIER is likely to be sufficient
+
+ Available options
+p,prompt-for-token=IDENTIFIER           Prompt for the PAT and store it in the \
+Keychain using IDENTIFIER
+
+P,paginate=OBJECT-PATH:NODE-NAME:CURSOR-NAME \
+Pageinate the query using the pageInfo returned on OBJECT-PATH and the \
+variable name CURSOR-NAME. OBJECT-PATH is a Key-Value Coding-style path that \
+traverses the resulting JSON object graph. NODE-NAME is the name of the node \
+under OBJECT-PATH where the paginated results can be found. The query must \
+request pageInfo.endCursor and pageInfo.hasNextPage on the object at \
+OBJECT-PATH and use the CURSOR-NAME variable in the appropriate object \
+constraint (e.g. the "after" constraint on membershipWithRole)
+
+$(CLI.get_global_blurb)
+"
+
+O_PERSONAL_ACCESS_TOKEN=
+O_TOKEN_KEYCHAIN_IDENTIFIER=
+O_PAGINATED_OBJECT=
+O_PAGE_NODE=
+O_CURSOR_NAME=
+O_ACTION='__query'
+O_QUERY=
+
+# MARK: Globals
+G_KEYCHAIN_PREFIX='com.github.pat.'
+
+# MARK: Command Implementation
+function __query()
+{
+	local pat=
+	local r=
+
+	if [ -n "$O_TOKEN_KEYCHAIN_IDENTIFIER" ]; then
+		pat=$(Keychain.get_password)
+	else
+		pat="$O_PERSONAL_ACCESS_TOKEN"
+	fi
+
+	GitHubQL.init "$pat" "$O_QUERY"
+	if [ -n "$O_CURSOR_NAME" ]; then
+		GitHubQL.paginate "$O_PAGINATED_OBJECT" \
+				"$O_PAGE_NODE" \
+				"$O_CURSOR_NAME"
+	fi
+
+	r=$(GitHubQL.query)
+
+	Plist.init_with_raw "json" "$r"
+	Plist.get "json-human"
+}
+
+function __prompt_for_token()
+{
+	local pw=
+
+	Keychain.delete_password
+	CLI.die_check $? "delete old token"
+
+	pw=$(Keychain.get_password_or_prompt "personal access token")
+	CLI.die_check $? "add token to Keychain"
+}
+
+function __cmd()
+{
+	if [ -n "$O_TOKEN_KEYCHAIN_IDENTIFIER" ]; then
+		Keychain.init_identifier "$O_TOKEN_KEYCHAIN_IDENTIFIER"
+	fi
+
+	$O_ACTION "$@"
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+	local auth_cnt=0
+	local expect_query=t
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-t | --personal-access-token=*)
+			O_PERSONAL_ACCESS_TOKEN="$arg"
+			(( auth_cnt += 1 ))
+			shift
+			;;
+		-k | --token-keychain-identifier=*)
+			O_TOKEN_KEYCHAIN_IDENTIFIER="$G_KEYCHAIN_PREFIX$arg"
+			(( auth_cnt += 1 ))
+			shift
+			;;
+		-p | --prompt-for-token=*)
+			O_TOKEN_KEYCHAIN_IDENTIFIER="$G_KEYCHAIN_PREFIX$arg"
+			O_ACTION='__prompt_for_token'
+			expect_query=
+			shift
+			;;
+		-P | --paginate=*)
+			arg_opt=($(CLI.split_specifier_nospace ':' "$arg"))
+			if [ ${#arg_opt[@]} -ne 3 ]; then
+				CLI.die "bad cursor specifier: $arg"
+			fi
+
+			O_PAGINATED_OBJECT="${arg_opt[0]}"
+			O_PAGE_NODE="${arg_opt[1]}"
+			O_CURSOR_NAME="${arg_opt[2]}"
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	if [ -n "$expect_query" ]; then
+		if [ $auth_cnt -ne 1 ]; then
+			CLI.die "must specify a PAT or Keychain identifier, but not both"
+		fi
+
+		if [ $# -lt 1 ]; then
+			CLI.die_noopt "$1" "a GraphQL query"
+		fi
+
+		O_QUERY="$1"
+	fi
+
+	__cmd "$@"
+}
+
+__main "$@"

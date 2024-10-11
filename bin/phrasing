@@ -1,0 +1,162 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Git.sh"
+
+# Parsed options
+GIT_PARSEOPT_SPEC="\
+phrasing [options] [WORD-COUNT]
+
+Generate new passphrases using a Diceware word list. A 7-word passphrase is \
+generated unless WORD-COUNT is provided.
+
+Are we still doing phrasing?
+
+$(CLI.get_stuckopt_blurb)
+--
+ Available options
+D,delimiter?DELIMITER   use DELIMITER between words instead of the default \
+'-'; if not provided, no delimiter is used; the magic value \"space\" may be \
+used to indicate a space between each word
+n,omit-newline!         do not terminate output with a new line
+U,upper-case!           force output to contain an upper-case character
+
+ Esoteric options
+ignore-word-count       ignores the positional argument for WORD-COUNT
+
+$(CLI.get_global_blurb)
+"
+
+O_DELIMITER=-
+O_OMIT_NEWLINE=
+O_UPPER_CASE=
+O_WORD_CNT=7
+O_IGNORE_WORD_COUNT=
+
+# MARK: Utilities
+function random_decimal()
+{
+	local x=
+
+	x=$(rand 2 "u")
+	echo -n $x
+}
+
+function roll()
+{
+	local dwidx=""
+
+	for i in $(seq 1 5); do
+		r=$(random_decimal)
+		r=$(( $r  % 6 ))
+		r=$(( $r + 1 ))
+		dwidx+="$r"
+	done
+
+	echo -n "$dwidx"
+}
+
+# MARK: Command Implementation
+function __cmd()
+{
+	local n="$O_WORD_CNT"
+	local tab=$'\t'
+	local delim=""
+	local pwd=
+	local upper_idx=0
+
+	if [ -n "$O_UPPER_CASE" ]; then
+		upper_idx=$(random_decimal)
+		upper_idx=$(( upper_idx % $n ))
+		upper_idx=$(( upper_idx + 1 ))
+	fi
+
+	for i in $(seq 1 $n); do
+		idx=$(roll)
+
+		line=$(grep "$idx" "${dotfiles}/share/misc/diceware.wordlist")
+		line=$(sed -E "s/${tab}/ /;" <<< "$line")
+		word=$(sed -E "s/[1-6]+ //;" <<< $line)
+
+		if [ $i -eq $upper_idx ]; then
+			word=$(toupper "$word")
+		fi
+
+		pw+="$delim$word"
+		delim=$O_DELIMITER
+		if [ "$delim" = "space" ]; then
+			delim=" "
+		fi
+	done
+
+	echo -n "$pw"
+	if [ -z "$O_OMIT_NEWLINE" ]; then
+		echo ""
+	fi
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-D | --delimiter*)
+			O_DELIMITER="$arg"
+			shift
+			;;
+		-n | --omit-newline)
+			O_OMIT_NEWLINE=t
+			shift
+			;;
+		-U | --upper-case)
+			O_UPPER_CASE=t
+			shift
+			;;
+		--ignore-word-count)
+			O_IGNORE_WORD_COUNT=t
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	if [ -z "$O_IGNORE_WORD_COUNT" ]; then
+		if [ $# -ge 1 ]; then
+			O_WORD_CNT=$1
+		fi
+	fi
+
+	__cmd
+}
+
+__main "$@"

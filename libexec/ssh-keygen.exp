@@ -1,0 +1,18 @@
+#!/usr/bin/expect
+
+set type [lindex $argv 0]
+set bits [lindex $argv 1]
+set identity_file [lindex $argv 2]
+set comment [lindex $argv 3]
+
+expect_user -re ".*\n"
+set passphrase $expect_out(buffer)
+
+spawn ssh-keygen -q -t "$type" -b "$bits" -f "$identity_file" -C "$comment"
+expect "Enter passphrase (empty for no passphrase): "
+send $passphrase
+expect "Enter same passphrase again: "
+send $passphrase
+expect -re ".*\n"
+interact
+wait

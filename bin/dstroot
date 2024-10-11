@@ -1,0 +1,193 @@
+#!/bin/bash -O extglob
+
+# This utility will be invoked in distribution root directories which may be
+# blown away and re-created, leaving the working directory stale. So do a cd(1)
+# back into whatever the shell's PWD is. The shell will still complain, but
+# ultimately the right thing will happen.
+cd .
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Git.sh"
+
+# Parsed options
+GIT_PARSEOPT_SPEC="\
+dstroot [options] [COMMAND, ...]
+
+Spawns a shell with the appropriate environment to run content from inside the \
+distribution root in the current working directory. This includes dyld(1) \
+environment variables and the shell PATH.
+
+If a COMMAND is given, it is executed directly in this environment rather than \
+spawning a shell.
+
+Note that if you maintain a shell in a distribution root directory that you \
+are iteratively re-building, the working directory may be deleted and re-\
+created from under the shell. In this event, you will see the following error \
+from the shell:
+
+shell-init: error retrieving current directory: getcwd: \
+cannot access parent directories: No such file or directory
+chdir: error retrieving current directory: getcwd: \
+cannot access parent directories: No such file or directory
+
+To resolve this condition simply run
+
+    cd .
+
+and run the command again.
+
+Note that in order to use libraries within the distribution root, the binary \
+may need to be signed with library validation explicitly, i.e. with -o library \
+given to codesign(1).
+
+$(CLI.get_stuckopt_blurb)
+--
+ Available options
+t,tmpdir=DIRECTORY      set TMPDIR to DIRECTORY
+D,dyld-debug            set environment variables which instruct dyld(1) to \
+dump information to stderr
+
+$(CLI.get_global_blurb)
+"
+
+O_COMMAND=
+O_TMPDIR=
+O_DYLD_DEBUG=
+
+# MARK: Utilities
+function check_code_signing()
+{
+	local path="$1"
+	local resolved=
+	local base=
+	local codesign_out=
+
+	resolved="$(which $path)"
+	if [ $? -ne 0 ]; then
+		# Let the implementation fall over later when trying to run this tool.
+		return 0
+	fi
+
+	base="$(basename "$resolved")"
+	CLI.command codesign -dv "$resolved"
+	codesign_out=$(codesign -dv "$resolved" 2>&1)
+
+	grep 'library-validation' <<< "$codesign_out"
+	if [ $? -ne 0 ]; then
+		CLI.warn "$base is not signed with library validation;" \
+				"libraries from distribution root may not be used"
+	fi
+}
+
+# MARK: Command Implementation
+function __cmd()
+{
+	local paths=()
+	local paths_frobbed=()
+	local real_dstroot=$(realpath "$pwd")
+	local path=
+	local tmpdir=$TMPDIR
+	local dyld_root_path="$real_dstroot"
+	local library_paths=
+	local framework_paths=
+	local shell="$SHELL"
+
+	IFS=':' read -ra paths <<< "$PATH"
+	for p in "${paths[@]}"; do
+		paths_frobbed+=("$real_dstroot$p")
+	done
+
+	path=$(printf ":%s" "${paths_frobbed[@]}")
+	path=${path:1}
+	path="$path:$PATH"
+
+	if [ -n "$O_TMPDIR" ]; then
+		tmpdir="$O_TMPDIR"
+	fi
+
+	library_paths+=":$dyld_root_path/usr/local/lib"
+	framework_paths+=":$dyld_root_path/Library/Frameworks"
+	framework_paths+=":$dyld_root_path/Library/PrivateFrameworks"
+
+	Module.config 0 "dstroot"
+	Module.config 1 "dstroot path" "$real_dstroot"
+	Module.config 1 "PATH" "$path"
+	Module.config 1 "TMPDIR" "$tmpdir"
+	Module.config 1 "DYLD_LIBRARY_PATH" "$library_paths"
+	Module.config 1 "DYLD_FRAMEWORK_PATH" "$framework_paths"
+
+	export PATH="$path"
+	export TMPDIR="$tmpdir"
+	export DYLD_LIBRARY_PATH="$library_paths"
+	export DYLD_FRAMEWORK_PATH="$framework_paths"
+	export DSTROOT="$real_dstroot"
+
+	if [ -n "$O_DYLD_DEBUG" ]; then
+		export DYLD_PRINT_LIBRARIES=1
+		export DYLD_PRINT_SEARCHING=1
+	fi
+
+	if [ -z "$O_COMMAND" ]; then
+		CLI.command $shell
+		exit $?
+	else
+		check_code_signing "$1"
+		CLI.command $@
+	fi
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-t | --tmpdir=*)
+			O_TMPDIR="$arg"
+			shift
+			;;
+		-d | --dyld-debug)
+			O_DYLD_DEBUG=t
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	if [ $# -gt 0 ]; then
+		O_COMMAND="$1"
+	fi
+
+	__cmd "$@"
+}
+
+__main "$@"

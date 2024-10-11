@@ -1,0 +1,121 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Git.sh"
+
+# Usage
+GIT_PARSEOPT_SPEC="\
+git-advance-branch [options] -- [arguments to git-rebase]
+
+Updates the base branch of the current branch with changes from the remote \
+tracking branch and rebases the current branch on top of it.
+
+$(CLI.get_stuckopt_blurb)
+--
+ Available options
+b,base-branch=BASE-BRANCH        Rebase on top of BASE-BRANCH instead of the \
+branch's base tag
+p,push                           Force-pushes the resulting branch to the remote
+
+$(CLI.get_global_blurb)
+"
+O_BASE=
+O_PUSH=
+
+# MARK: Cleanup
+CL_BRANCH=
+
+# MARK: Command Implementation
+function __cleanup()
+{
+	if [ -n "$CL_BRANCH" ]; then
+		Git.run checkout "$CL_BRANCH"
+	fi
+}
+
+function __cmd()
+{
+	Git.update_branch_from_remote "$O_BASE"
+	CLI.die_check $? "pull base branch from remote: $O_BASE"
+
+	Git.run rebase "$@" "$O_BASE"
+	CLI.die_check $? "advance branch"
+
+	if [ -n "$O_PUSH" ]; then
+		Git.run push -f '%REMOTE'
+		CLI.die_check $? "push rebased branch"
+	fi
+
+	CL_BRANCH=
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-b | --base-branch=*)
+			O_BASE="$arg"
+			shift
+			;;
+		-p | --push)
+			O_PUSH=t
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	CLI.init_git
+	CLI.init_cleanup __cleanup
+
+	if [ -z "$O_BASE" ]; then
+		O_BASE="$(Git.get_parent_branch)"
+		if [ -z "$O_BASE" ]; then
+			# If our base is not a branch, then rebase on top of the default
+			# branch, since we were probably based on a tag.
+			O_BASE=$(Git.get_default_branch)
+		fi
+
+		CLI.status "using base branch: $O_BASE"
+	fi
+
+	if [ "$1" == "--" ]; then
+		shift
+	fi
+
+	CL_BRANCH="$(Git.get_current_branch)"
+	__cmd "$@"
+}
+
+__main "$@"

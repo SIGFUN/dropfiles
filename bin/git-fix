@@ -1,0 +1,691 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Git.sh"
+. "${libdir}/Bug.sh"
+. "${libdir}/Branch.sh"
+. "${libdir}/Plist.sh"
+. "${libdir}/Keychain.sh"
+
+# Usage
+GIT_PARSEOPT_SPEC="\
+git-fix [options] [BUG]
+
+Manages fix branches associated with tickets in a bug tracking system.
+
+The repository must have been initialized with 'git fix --init' prior to \
+creating any fix branches.
+
+Fix branches can begin in the 'wip' namespace (\"work in progress\"). This \
+namespace is intended to facilitate relatively independent development and \
+aggressive cleanup/retirement policies for its branches.
+
+Once work is completed, a branch is promoted to the 'pr' namespace, which will \
+create a new branch rebased on top of the latest base ref from the remote.
+
+Smaller changes can simply be created directly in the 'pr' namespace, in which \
+case promoting them will modify the bug in the bug tracking system without \
+impacting the branch.
+
+$(CLI.get_stuckopt_blurb)
+--
+ Mutually exclusive options
+i,init=EMPLOYER             Initializes the current repository with the \
+git-config(1) parameters corresponding to EMPLOYER, which refers to the \
+corresponding gitconfig file in the .dotgit directory
+
+s,start?wip|pr              Create a new fix branch according to the \
+configuration's specifications the 'wip' or 'pr' fix namespace. The bug \
+tracking this change is updated to indicate that work has begun on the \
+fix, even if the branch is created according to the 'pr' namespace. If \
+unspecified, the branch is created in the 'wip' namespace. If the current \
+branch is a wip branch, the bug associated with it will be updated to indicate \
+that work has paused
+
+w,work-on                    Fetch and check out the branch associated with \
+BUG in the bug tracker and updates the BUG state to reflect that the issue is \
+being actively worked on
+
+p,promote                   Promote the current fix branch from the 'wip' \
+namespace to the 'pr' namespace and updates the bug tracker with the current \
+state. When this option is used, BUG is derived from the current branch. If \
+a title is detected in the current branch, the new 'pr' branch will be created \
+with a title queried from the bug tracker unless overridden with the T,title \
+option
+
+l,list=commits|bugs         Lists information about the commits on the \
+current branch, either the commits on the branch, or the problem reports \
+addressed by those commits
+
+B,show-base-branch          Prints the base branch of the current branch
+
+ General options
+b,base=BASE-BRANCH|tags/BASE-TAG|latest \
+When creating a new fix branch, the base branch or tag from which to create \
+the new branch (tags should be specified with a leading 'tags/', e.g. \
+'tags/2.0.2'). If unspecified, the new branch is created from the current \
+one; the value 'latest' will check out the repository's default branch, pull \
+from it, and use the result as the base branch
+
+t,title?TITLE               Embed TITLE in the branch name by preprocessing \
+TITLE into a form suitable for a branch name (e.g. removing spaces and special \
+characters). If TITLE is not given, git-bug will be used to query the bug \
+tracker for a suitable TITLE
+
+T,title-word-cap=NUMBER-OF-WORDS \
+Limit the number of words taken from the TITLE given to the t,title option to \
+NUMBER-OF-WORDS. If unspecified, the default is 5
+
+P,project=PROJECT-NAME      Set the repository's project name in the bug \
+tracker. If this is unspecified, the name is derived from the repository's \
+name
+
+r,create-pull-request       When promoting, also create a pull request with \
+PR backend for the project
+
+X,offline                   Operate offline, without making API requests to \
+the repository's bug tracker. Some functionality will either not be available, \
+or it will be performed with best guesses based on locally available state. \
+Any git(1) operations which interact with the remote will be sent to a special \
+'offline' remote which is locally hosted in ~/.offline
+
+$(CLI.get_global_blurb)
+"
+
+O_ACTION=__start
+O_GITCONFIG=
+O_NAMESPACE="wip"
+O_BASE=
+O_LIST=
+O_TITLE=
+O_TITLE_WORD_CAP=
+O_PROJECT=
+O_OFFLINE=
+O_PROBLEM=
+
+# MARK: Globals
+G_INIT_BUG=t
+G_GET_PREFIX=
+G_BUG_TRACKER=default
+G_BUG_PREFIX=
+G_BUG_ID=
+
+# MARK: Cleanup
+CL_BRANCH=
+CL_BUG=
+
+# MARK: Utilities
+function configure_branch()
+{
+	local title="$1"
+	local js=
+	local component=
+
+	if [ -n "$O_BASE" ]; then
+		Branch.set_base_ref "$O_BASE"
+	fi
+
+	if [ -n "$G_BUG_PREFIX" ]; then
+		Branch.set_bug_number_prefix "$G_BUG_PREFIX"
+	fi
+
+	CLI.status "querying properties for $G_BUG_ID..."
+
+	Bug.query_field "Component"
+	Bug.query_field "Title"
+	js=$(Bug.query)
+	CLI.die_ifz "$js" "failed to query bug fields"
+
+	Plist.init_with_raw "json" "$js"
+	component=$(Plist.get_value "Component" "string")
+
+	if [ -n "$component" ]; then
+		Branch.set_component "$component"
+	fi
+
+	case "$title" in
+	query)
+		# We query the bug tracker for the bug's title. If that fails, it's not
+		# a huge deal.
+		title=$(Plist.get_value "Title" "string")
+		CLI.warn_ifz "$title" "failed to get problem title; " \
+				"branch will be created without one"
+		;;
+	'')
+		# No title argument provided, so branch name won't include it.
+		;;
+	*)
+		# The user provided a title they wanted to use.
+		title="$O_TITLE"
+		;;
+	esac
+
+	if [ -n "$title" ]; then
+		Branch.set_title "$title"
+	fi
+
+	if [ -n "$O_TITLE_WORD_CAP" ]; then
+		Branch.set_title_word_count "$O_TITLE_WORD_CAP"
+	fi
+}
+
+function create_pull_request()
+{
+	local branch="$1"
+	local target="$2"
+	local title="$3"
+	local whichlib=
+	local org=
+	local proj="$(Git.get_name)"
+	local account=
+	local url=
+	local fullname=
+	local comment=
+
+	whichlib="$(Git.run config fix.pr.backend)"
+	CLI.die_ifz "$whichlib" "no code host library"
+
+	org="$(Git.run config fix.pr.organization)"
+	CLI.die_ifz "$org" "no code host organization"
+
+	account="$(Git.run config fix.pr.account)"
+	CLI.die_ifz "$account" "no code host account"
+
+	Module.load_lazy "$whichlib"
+	CLI.die_check $? "find/load module: $whichlib"
+
+	${whichlib}.init "$org" "$proj" "$account"
+	${whichlib}.PR.init "$branch" "$target" "$title"
+
+	url=$(${whichlib}.PR.create)
+
+	fullname=$(Git.run config user.name)
+	if [ -n "$fullname" ]; then
+		fullname="$fullname ($account)"
+	else
+		fullname="$account"
+	fi
+
+	comment=$(strsmash $'\n' \
+		"$fullname opened a pull request at the following URL:" \
+		"" \
+		"  $url" \
+	)
+
+	# Hack, but the returned text might not be a URL; it might just be a message
+	# saying a pull request was already created, e.g. GitHub.
+	if [[ "$url" =~ http ]]; then
+		CLI.status "adding comment: $comment"
+		Bug.add_comment "$comment"
+	fi
+
+	echo "$url"
+}
+
+function pause_work()
+{
+	local p="$1"
+	local ns="$2"
+	local pid="${G_BUG_PREFIX}${p}"
+
+	if [ -z "$p" ]; then
+		return
+	fi
+
+	Bug.init "$p"
+
+	case "$ns" in
+	wip)
+		CLI.status "pausing work on ${pid}..."
+
+		Bug.update_field_oneshot "State" "scheduled"
+		CLI.warn_check $? "update progress status for $p"
+		;;
+	pr)
+		# The old bug was already in review, so we're not pausing any work.
+		;;
+	*)
+		;;
+	esac
+}
+
+# MARK: Command Implementation
+function __init()
+{
+	local gitconfig=
+	local hooks=
+	local gitdir="$(Git.get_directory)"
+
+	gitconfig=$(Module.find_resource ".dotgit/gitconfig_${O_GITCONFIG}")
+	CLI.die_ifz "$gitconfig" "no git config found for $O_GITCONFIG"
+
+	Git.run config --local include.path "$gitconfig"
+	CLI.die_check $? "include git config: $gitconfig"
+
+	Bug.set_project "$O_PROJECT"
+	CLI.die_check $? "configure bug tracker project"
+
+	hooks=$(Module.find_resource ".dotgit/hooks_global")
+	CLI.die_ifz "$hooks" "no global hooks found"
+
+	CLI.command cp "$hooks"/* "$gitdir/hooks/"
+
+	hooks=$(Module.find_resource ".dotgit/hooks_${O_GITCONFIG}")
+	if [ -n "$hooks" ]; then
+		CLI.command cp "$hooks"/* "$gitdir/hooks/"
+	fi
+
+	# Query the bug prefix, which will cache it.
+	Bug.init
+	q Bug.query_tracker_property "BugPrefix" "$O_PROJECT"
+}
+
+function __start()
+{
+	local old_bug=
+	local old_ns=
+	local branch_name=
+
+	Branch.init "$O_PROBLEM" "$O_NAMESPACE"
+	configure_branch "$O_TITLE"
+
+	# If we're currently working on something, then update the bug to say that
+	# work has paused.
+	old_bug=$(Branch.guess_primary_problem)
+	old_ns=$(Branch.get_namespace)
+
+	CLI.status "creating fix branch $(Branch._derive_name)..."
+	branch_name=$(Branch.create_and_checkout)
+	CLI.die_ifz "$branch_name" "failed to create fix branch"
+
+	CLI.status "publishing $branch_name to remote..."
+	Git.run push -u '%REMOTE%' "$branch_name"
+	CLI.die_check $? "publish branch $branch_name"
+
+	CLI.status "beginning work on ${G_BUG_ID}..."
+
+	Bug.update_field "State" "active"
+	Bug.update_field "Branch" "$branch_name"
+	Bug.update
+	CLI.warn_check $? "update problem state"
+
+	pause_work "$old_bug" "$old_ns"
+}
+
+function __work_on()
+{
+	local old_bug=
+	local old_ns=
+	local branch=
+
+	old_bug=$(Branch.guess_primary_problem)
+	old_ns=$(Branch.get_namespace)
+
+	CLI.status "querying branch for ${G_BUG_ID}..."
+	branch=$(Bug.query_field_oneshot "Branch")
+	CLI.die_ifz "$branch" "failed to query problem branch"
+
+	CLI.status "fetching ${branch}..."
+	Git.run fetch '%REMOTE%' "$branch"
+	CLI.die_check $? "fetch branch: $branch"
+
+	Git.run checkout "$branch"
+	CLI.die_check $? "check out branch: $branch"
+
+	CLI.status "updating ${branch}..."
+	Git.run pull '%REMOTE%' "$branch"
+	CLI.die_check $? "pull branch"
+
+	CLI.status "resuming work on ${G_BUG_ID}..."
+	Bug.update_field_oneshot "State" "active"
+	CLI.die_check $? "update problem state"
+
+	pause_work "$old_bug" "$old_ns"
+}
+
+function __promote()
+{
+	local branch_name=
+	local target=
+	local url=
+
+	namespace=$(Branch.get_namespace)
+	CLI.die_ifz "$namespace" "could not determine branch namespace"
+
+	target=$(Git.get_parent_branch)
+	if [ -z "$target" ]; then
+		target=$(Git.get_default_branch)
+	fi
+
+	case "$namespace" in
+	wip)
+		Branch.init "$O_PROBLEM" "pr"
+
+		# If the user didn't express a preference at the command line, be a
+		# mensch and figure out whether the current branch has a title, and if
+		# so, include the title in the new one.
+		if [ -z "$O_TITLE" ]; then
+			Branch.has_title
+			if [ $? -eq 0 ]; then
+				title="query"
+			fi
+		fi
+
+		# Base the new branch off our current once, then we'll rebase it.
+		Branch.set_base_ref "$(Git.get_current_branch)"
+		configure_branch "$title"
+
+		CLI.status "creating pr branch $(Branch._derive_name)..."
+		branch_name=$(Branch.create_and_checkout)
+		CLI.die_ifz "$branch_name" "failed to create fix branch"
+
+		# Update the target branch for rebasing.
+		Git.update_branch_from_remote "$target"
+		CLI.die_check $? "update branch from remote: $target"
+
+		# Now rebase on top of the up-to-date base branch.
+		Git.run rebase "$target"
+		CLI.die_check $? "update branch from remote: $target"
+		;;
+	pr)
+		# We've already got a PR branch, so we just have to update the bug.
+		branch_name=$(Git.get_current_branch)
+		;;
+	esac
+
+	CLI.status "publishing $branch_name to remote..."
+	Git.run push -u '%REMOTE%' "$branch_name"
+	CLI.die_check $? "publish branch $branch_name"
+
+	if [ -n "$O_CREATE_PULL_REQUEST" ]; then
+		local title=
+
+		title=$(Bug.query_field_oneshot "Title")
+		CLI.die_ifz "$title" "failed to get bug title"
+
+		title="$O_PROBLEM: $title"
+		url=$(create_pull_request "$branch_name" "$target" "$title")
+		CLI.die_ifz "$url" "failed to create pull request"
+
+		echo "pull request url:"
+		echo "  $url"
+	fi
+
+	CLI.status "marking $O_PROBLEM as in review..."
+	Bug.update_field "State" "review"
+	Bug.update_field "Branch" "$branch_name"
+	Bug.update
+	CLI.warn_check $? "update problem state"
+}
+
+function __list()
+{
+	local problems=()
+
+	case "$O_LIST" in
+	commits)
+		Git.get_branch_commits
+		;;
+	bugs)
+		Branch.find_problems
+		;;
+	*)
+		CLI.die "invalid list specifier: $O_LIST"
+	esac
+}
+
+function __show_base_branch()
+{
+	Git.get_parent_branch
+}
+
+function __cleanup()
+{
+	if [ -n "$CL_BRANCH" ]; then
+		Git.run checkout "$CL_BRANCH"
+	fi
+
+	if [ -n "$CL_BUG" ]; then
+		Bug.cleanup
+	fi
+}
+
+function __cmd()
+{
+	CLI.start_debug
+
+	if [ -n "$G_INIT_BUG" ]; then
+		Bug.init
+		CL_BUG=t
+	fi
+
+	# If we're working offline, set up a local repository that can receive
+	# pushes and generally respond to git stuff so we don't have to guard every
+	# call site to git with a check to see whether online operation is
+	# permitted.
+	if [ -n "$O_OFFLINE" ]; then
+		local where="$HOME/.offline/$O_PROJECT.git"
+		local needs_push=
+
+		if [ ! -d "$where" ]; then
+			CLI.command mkdir -p "$where"
+
+			# We don't use the Git module here because we're initializing a new
+			# bare repository, and we don't wnat to inject work-tree or git-dir
+			# arguments. If we created the bare repository, we'll need to push
+			# our refs to it.
+			CLI.command git init -q "$where"
+			needs_push=t
+
+			# Now add the temporary remote to the repository.
+			Git.run remote add offline "$where"
+			CLI.die_check $? "add offline remote"
+		fi
+
+		# Now that we've got the new remote, set it for the duration of our run
+		# and push our refs to it if required. Note that this doesn't change the
+		# remote tracking branch of our current branch; it just redirects git
+		# operations.
+		Git.set_remote "offline"
+		if [ -n "$needs_push" ]; then
+			CLI.status "populating offline remote; this could take a while" \
+					"and is a one-time operation"
+			Git.run push --all '%REMOTE%'
+		fi
+
+		# Let the user know where their refs are going in case they want to sync
+		# them to the real remote later.
+		CLI.warn "operating offline; all relevant git operations will" \
+				"interact with the 'offline' mirror remote, which exists at"
+		CLI.warn ""
+		CLI.warn "  $where"
+
+		# Use the offline bug tracker to do our best and guess certain
+		# properties from local branch metadata.
+		G_BUG_TRACKER="Offline"
+	fi
+
+	# If we're dealing with a bug number, then we'll do a query to the bug
+	# tracker to get its canonical identity (basically, get the bug prefix). Do
+	# this after we've done the offline logic.
+	G_BUG_ID="${O_PROBLEM}"
+	if [ -n "$G_GET_PREFIX" ]; then
+		G_BUG_PREFIX=$(Bug.query_tracker_property "BugPrefix$" "$O_PROJECT")
+		if [ -z "$G_BUG_PREFIX" ]; then
+			G_BUG_PREFIX=$(Bug.query_tracker_property "BugPrefix" "$O_PROJECT")
+		fi
+	fi
+
+	if [ -n "$G_BUG_ID" ]; then
+		# The user should be able to provide a bug identifier with the prefix
+		# included if they want, so we sniff it out.
+		O_PROBLEM=$(strip_prefix "$O_PROBLEM" "$G_BUG_PREFIX")
+		G_BUG_ID="${G_BUG_PREFIX}${O_PROBLEM}"
+
+		# We use the complete bug identifier, since some systems, like Jira,
+		# namespace their identifiers. This saves the bug library from having to
+		# query the prefix itself.
+		Bug.init_problem "$G_BUG_ID"
+	fi
+
+	CLI.status "working on bug: $G_BUG_ID"
+	${O_ACTION} "$@"
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+	# Normally I hate initializing to a non-negative state, but in this case
+	# it's justified because the default action is "start", which expects a
+	# bug.
+	local expect_problem=t
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-i | --init=*)
+			O_GITCONFIG="$arg"
+			O_ACTION="__init"
+
+			G_INIT_BUG=
+			expect_problem=
+			shift
+			;;
+		-s | --start*)
+			arg_opt=($(CLI.parse_option_argument "$1"))
+			O_ACTION="__start"
+
+			G_GET_PREFIX=t
+			if [ -n "${arg_opt[1]}" ]; then
+				O_NAMESPACE="${arg_opt[1]}"
+			fi
+			shift
+			;;
+		-w | --work-on)
+			O_ACTION="__work_on"
+			shift
+			;;
+		-p | --promote)
+			O_ACTION="__promote"
+
+			G_GET_PREFIX=t
+			expect_problem=
+			shift
+			;;
+		-l | --list=*)
+			O_ACTION="__list"
+			O_LIST="$arg"
+			expect_problem=
+			shift
+			;;
+		-B | --show-base-branch)
+			O_ACTION="__show_base_branch"
+			expect_problem=
+			shift
+			;;
+		-b | --base=*)
+			O_BASE="$arg"
+			shift
+			;;
+		-t | --title*)
+			arg_opt=($(CLI.parse_option_argument "$1"))
+
+			if [ -n "${arg_opt[1]}" ]; then
+				O_TITLE="${arg_opt[1]}"
+			else
+				O_TITLE="query"
+			fi
+			shift
+			;;
+		-T | --title-word-cap=*)
+			O_TITLE_WORD_CAP="$arg"
+			;;
+		-P | --project=*)
+			O_PROJECT="$arg"
+			shift
+			;;
+		-r | --create-pull-request)
+			O_CREATE_PULL_REQUEST=t
+			shift
+			;;
+		-x | --offline)
+			O_OFFLINE=t
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	CLI.init_git
+
+	if [ -n "$expect_problem" ]; then
+		if [ $# -lt 1 ]; then
+			CLI.die_noopt "problem report"
+		fi
+
+		O_PROBLEM="$1"
+		shift
+	elif [ "$O_ACTION" = "__promote" ]; then
+		O_PROBLEM=$(Branch.guess_primary_problem)
+		CLI.die_ifz "$O_PROBLEM" "could not determine primary branch bug number"
+	fi
+
+	if [ -z "$O_PROJECT" ]; then
+		O_PROJECT=$(Git.get_name)
+	fi
+
+	if [ -z "$O_GITCONFIG" ]; then
+		# We need to have initialized this repository to include the appropriate
+		# configuration file.
+		local init_done=$(Git.run config fix.username)
+		CLI.die_ifz "$init_done" "please run git fix --init on this repository"
+
+		Git.check_tree_dirty
+		CLI.die_advise $? "please stash or commit changes to work tree"
+	fi
+
+	CLI.die_ifz "$O_ACTION" "please specify an action"
+
+	Module.config 0 "git-fix"
+	Module.config 1 "action" "$O_ACTION"
+	Module.config 1 "namespace" "$O_NAMESPACE"
+	Module.config 1 "base" "$O_BASE"
+	Module.config 1 "title" "$O_TITLE"
+	Module.config 1 "title word cap" "$O_TITLE_WORD_CAP"
+	Module.config 1 "list" "$O_LIST"
+	Module.config 1 "offline" "$O_OFFLINE"
+	Module.config 1 "problem" "$O_PROBLEM"
+
+	CLI.init_cleanup __cleanup
+	__cmd "$@"
+}
+
+__main "$@"

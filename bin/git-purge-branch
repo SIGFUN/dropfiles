@@ -1,0 +1,127 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Git.sh"
+
+# Usage
+GIT_PARSEOPT_SPEC="\
+git-purge-branch [options] [BRANCH]
+
+Removes BRANCH from the local repository. If BRANCH is currently checked out, \
+the repository will be switched to its default branch. If BRANCH is not \
+specified, the current branch will be deleted.
+
+$(CLI.get_stuckopt_blurb)
+--
+ Available options
+p,push                   Also delete the upstream tracking branch from the \
+remote. If the upstream cannot be identified, then the branch named BRANCH \
+will be deleted from the remote
+$(CLI.get_global_blurb)
+"
+O_PUSH=
+O_BRANCH=
+
+# MARK: Command Implementation
+function __cmd()
+{
+	local remote=
+	local upstream=
+
+	if [ -n "$O_PUSH" ]; then
+		# See if we can get upstream tracking information for the branch to
+		# delete. If not, then it probably means we don't have a local copy of
+		# it. In that case, just assume the remote's branch is named the same.
+		remote="$(Git.get_remote)"
+		upstream="$(Git.get_upstream "$O_BRANCH")"
+		if [ -n "$upstream" ]; then
+			upstream=$(strip_prefix "$upstream" "$remote/")
+		else
+			upstream="$O_BRANCH"
+		fi
+
+		# Delete the remote branch first so that we don't need the local copy
+		# for anything going forward.
+		CLI.status "deleting upstream branch: $remote/$upstream"
+
+		Git.run push --delete '%REMOTE%' "$upstream"
+		CLI.die_check $? "delete upstream tracking branch: $upstream"
+	fi
+
+	# See if we're trying to delete the current branch. If so, switch away from
+	# it.
+	if [ "$O_BRANCH" = "$(Git.get_current_branch)" ]; then
+		local b_default="$(Git.get_default_branch)"
+
+		Git.run checkout "$b_default"
+		CLI.die_check $? "check out safe harbor: $b_default"
+	fi
+
+	# Now check and see if we have the branch locally.
+	Git.run branch -l | grep -q "$O_BRANCH"
+	if [ $? -eq 0 ]; then
+		Git.run branch -D "$O_BRANCH"
+		CLI.die_check $? "delete branch: $O_BRANCH"
+	else
+		CLI.status "branch does not exist locally"
+	fi
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-p | --push)
+			O_PUSH=t
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	CLI.init_git
+
+	if [ $# -ge 1 ]; then
+		O_BRANCH="$1"
+		shift
+	fi
+
+	if [ -z "$O_BRANCH" ]; then
+		O_BRANCH="$(Git.get_current_branch)"
+	fi
+
+	__cmd "$@"
+}
+
+__main "$@"

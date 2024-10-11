@@ -1,0 +1,129 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+
+# Parsed options
+GIT_PARSEOPT_SPEC="\
+sshauth [options] HOST
+
+Authorizes an ssh identity on HOST, a remote server to which the user \
+possesses a password to an account which has access to a shell. HOST may embed \
+a username via the conventional method, i.e. USERNAME@HOSTNAME.
+
+$(CLI.get_stuckopt_blurb)
+--
+ Available options
+u,username=USERNAME     the username to authorize
+k,public-key=KEY-PATH   the public key file to use for authorization; if \
+unspecified, ~/.ssh/id_ed25519.pub will be used
+F,force                 forces the operation to take place, even if the \
+given public key file does not appear to be a public key
+
+$(CLI.get_global_blurb)
+"
+
+O_HOST=
+O_USERNAME="$USER"
+O_KEYFILE="$HOME/.ssh/id_ed25519.pub"
+O_RELAX_SUFFIX=
+
+# MARK: Command Implementation
+function __cmd()
+{
+	Module.config 0 "ssh"
+	Module.config 1 "host" "$O_HOST"
+	Module.config 1 "username" "$O_USERNAME"
+	Module.config 1 "public key" "$O_KEYFILE"
+	Module.config 1 "allow non-obvious key" "$O_RELAX_SUFFIX"
+
+	# If the server is running an older OpenSSH, we'll need to specify that we
+	# are okay with RSA and that we prefer password authentication, otherwise we
+	# may try too many key exchanges before the server cuts us off, and we never
+	# get to password authentication.
+	cat "$O_KEYFILE" | \
+			CLI.command ssh \
+				-o 'PreferredAuthentications password' \
+				-o 'HostKeyAlgorithms +ssh-rsa' \
+				-o 'PubkeyAcceptedKeyTypes +ssh-rsa' \
+				"${O_USERNAME}@${O_HOST}" \
+				'mkdir -p .ssh; cat >> .ssh/authorized_keys'
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-u | --username=*)
+			O_USERNAME="$arg"
+			shift
+			;;
+		-k | --public-key=*)
+			O_KEYFILE="$arg"
+			shift
+			;;
+		-F | --force)
+			O_RELAX_SUFFIX=t
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	if [ $# -lt 1 ]; then
+		CLI.die_noopt "host"
+	fi
+
+	O_HOST="$1"
+	shift 1
+
+	if [ -z "$O_RELAX_SUFFIX" ]; then
+		if [[ ! "$O_KEYFILE" =~ \.pub$ ]]; then
+			local file=$(basename "$O_KEYFILE")
+
+			CLI.err "$file does not appear to be a public key file;" \
+				"if you wish to use it in the handshake anyway," \
+				"you can use the -F option"
+			exit $EX_NOINPUT
+		fi
+	fi
+
+	if [[ "$O_HOST" =~ \@ ]]; then
+		O_USERNAME="${O_HOST%%@*}"
+		O_HOST="${O_HOST#*@}"
+	fi
+
+	__cmd "$@"
+}
+
+__main "$@"

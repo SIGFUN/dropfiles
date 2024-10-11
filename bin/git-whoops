@@ -1,0 +1,109 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Git.sh"
+
+# Usage
+GIT_PARSEOPT_SPEC="\
+git-whoops [options] [COMMIT] -- [arguments to git-rebase]
+
+Commits all changes in the tree in a fixup commit to COMMIT. If COMMIT is not \
+specified, HEAD is used. Once committed, the current branch is rebased on top \
+of COMMIT~1 to squash the fixup commit into its destination commit.
+
+$(CLI.get_stuckopt_blurb)
+--
+ Available options
+p,push                           Force-pushes the resulting branch to the remote
+
+$(CLI.get_global_blurb)
+"
+O_COMMIT=HEAD
+O_PUSH=
+
+# MARK: Command Implementation
+function __cmd()
+{
+	local h=
+
+	# Normalize the tree-ish to a hash since we're about to change HEAD by doing
+	# a commit.
+	h=$(Git.run rev-parse "$O_COMMIT")
+	CLI.die_ifz "$h" "failed to get commit hash for: $O_COMMIT"
+
+	Git.run_quiet commit -a --fixup "$h"
+	CLI.die_check $? "fixup commit failed"
+
+	# For reasons that no one seems to understand, git-rebase has to be run in
+	# interactive mode to do anything like auto-squashing. So we pass the -i
+	# option, but set the sequence editor to "nothing" to avoid the trip through
+	# the editor.
+	#
+	# https://tinyurl.com/4k6ancrc
+	GIT_SEQUENCE_EDITOR=: Git.run rebase --autosquash -i "$@" ${h}~1
+	CLI.die_check $? "rebase failed"
+
+	if [ -n "$O_PUSH" ]; then
+		Git.run push -f '%REMOTE'
+		CLI.die_check $? "push rebased branch"
+	fi
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-p | --push)
+			O_PUSH=t
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	CLI.init_git
+
+	if [ $# -ge 1 ]; then
+		O_COMMIT="$1"
+		shift
+	fi
+
+	if [ "$1" == "--" ]; then
+		shift
+	fi
+
+	__cmd "$@"
+}
+
+__main "$@"

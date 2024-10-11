@@ -1,0 +1,460 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Git.sh"
+. "${libdir}/Statistics.sh"
+
+# Usage
+GIT_PARSEOPT_SPEC="\
+git-prosecute [options] [PATH, PATH, ...]
+
+Identifies potential code owners for the PATHs in a git repository by one of \
+the following strategies:
+
+Commit-based
+Lists the contributors to the repository and the number of commits contributed \
+over a specified time period (measured in years). If the number of commits \
+contributed by an author exceeds a specified number of standard deviations \
+from the mean, they are selected as a code owner candidate. To control for \
+codebases with poor commit discipline, only merge commits are considered.
+
+Line-based
+Lists the commits to the repository and examines the total lines displaced \
+against the total number of files in each commit. The average of this value \
+across all commits for an author is calculated, and if this average exceeds \
+the specified number of standard deviations from the average of all author \
+averages, the author is selected as a code owner candidate.
+
+Each PATH is separately examined, with a separate list of candidate owners \
+produced. If no PATHs are given, all commits tracked in the current working \
+directory are examined.
+
+If the magic value '@TRACKED' is given for PATH, the command will run as \
+though the output of 'git ls-tree --name-only HEAD' were passed to it.
+
+Since strategies may rely on distinguishing merges from non-merges, this tool \
+should only be run on mainline branches.
+
+$(CLI.get_stuckopt_blurb)
+--
+ Available options
+t,timeframe=N-YEARS              Analyze the commits from the past N-YEARS \
+years. If unspecified, the default is 1.
+
+s,standard-deviations=N          Select contributors whose commits exceed the \
+mean by N standard deviations. If unspecified, the default is 2
+
+l,shortlog-paths                Interpret the list of PATHs the way that \
+git-shortlog would, and produce a combined ownership suggestions for all of \
+them rather than individual suggestions for each
+
+S,strategy=OWNERSHIP-STRATEGY   The strategy to employ for determining \
+ownership, currently either 'commit' or 'line'. If unspecified, the default is \
+'commit'
+
+$(CLI.get_global_blurb)
+"
+
+O_YEARS=1
+O_STDDEVS=2
+O_SHORTLOG_PATHS=
+O_STRATEGY=identify_ownership_commits
+
+# MARK: Globals
+G_LOCFACTOR=1000000
+
+# MARK: Utilities
+function stddev_population()
+{
+	local t=0
+	local n_entries=0
+	local mean=
+	local variance=
+	local d=
+
+	for n in "$@"; do
+		(( t += n ))
+		(( n_entries++ ))
+	done
+
+	mean=$(( t / n_entries ))
+
+	for n in "$@"; do
+		local v_n=
+
+		v_n=$(( n - mean ))
+		v_n=$(( v_n ** 2 ))
+		(( variance += v_n ))
+	done
+
+	variance=$(( variance / n_entries ))
+	d=$(bc <<< "sqrt($variance)")
+	echo "$mean" "$d"
+}
+
+function ownership_strategy_commits()
+{
+	local d="$1"
+	local paths=()
+	local shortlog=
+	local ifs_old=$IFS
+	local lines=
+	local author_map=()
+	local n_commits=()
+	local stats=()
+	local mean=
+	local stddev=
+	local i=0
+	local perps=()
+	local range=
+
+	shift
+	shortlog="$(Git.run shortlog -n \
+			--since "$d" \
+			--summary \
+			--merges "$@")"
+
+	IFS=$'\n' lines=($shortlog)
+	IFS=$ifs_old
+	for l in "${lines[@]}"; do
+		local n=
+		local author=
+
+		# The number of commits is in the first column, and the author is in the
+		# second column. The author will probably have spaces in it, so don't
+		# try to do this with array separation in the shell.
+		n=$(grep -oE '^\s*[0-9]+' <<< "$l")
+		n=$(tr -d ' ' <<< "$n")
+		author=$(sed -E 's/^[[:space:]]*[0-9]+[[:space:]]+//;' <<< "$l")
+		author_map+=("$author" "$n")
+		n_commits+=("$n")
+	done
+
+	if [ ${#n_commits[@]} -gt 0 ]; then
+		Statistics.init "${n_commits[@]}"
+		mean=$(Statistics.mean)
+		stddev=$(Statistics.standard_deviation)
+		range=$(( mean + (stddev * O_STDDEVS) ))
+
+		CLI.debug "paths: $@"
+		CLI.debug "commits since: $d"
+		CLI.debug "mean commits: $mean"
+		CLI.debug "population standard deviation: $stddev"
+		CLI.debug "owner minimum commits: $range"
+
+		for (( i = 0; i < ${#author_map[@]}; i += 2 )); do
+			local author="${author_map[$(( i + 0 ))]}"
+			local n="${author_map[$(( i + 1 ))]}"
+
+			if [ $n -ge $range ]; then
+				CLI.status "identified potential owner:" \
+						"name = $author, commits = $n"
+				perps+=("$author")
+			fi
+		done
+
+		if [ ${#perps[@]} -eq 0 ]; then
+			local top_person="${author_map[0]}"
+
+			# Just choose the top committer in this case.
+			CLI.debug "using top contributor: $author"
+			perps+=("$top_person")
+		fi
+	else
+		CLI.debug "no commits found for: $@"
+		perps+=("<none>")
+	fi
+
+	paths=$(joinby ", " "$@")
+	echo "$paths"
+
+	for pc in "${perps[@]}"; do
+		echo "   $pc"
+	done
+}
+
+function ownership_strategy_lines()
+{
+	local d="$1"
+	local paths=()
+	local authors_raw=
+	local authors=()
+	local authors_impacts=()
+	local mean=
+	local stddev=
+	local boundary=
+	local perps=()
+
+	# First, get a list of all commit authors in the directory and sort/unique
+	# the list.
+	shift
+	authors_raw=$(Git.run log --no-merges --pretty=tformat:'%an' --since "$d")
+	authors_raw=$(sort <<< "$authors_raw")
+	authors_raw=$(uniq <<< "$authors_raw")
+
+	# Note that unsetting IFS basically just returns it to its default value,
+	# which is more or less $' \t\n'.
+	IFS=$'\n'
+	authors=($authors_raw)
+	unset IFS
+
+	# Now go through the authors and collect the commit statistics for each one.
+	for au in "${authors[@]}"; do
+		local commit_cur=
+		local commits=
+		local f_change=0
+		local l_insert=0
+		local l_delete=0
+		local t_insert=0
+		local t_delete=0
+		local impact_series=()
+		local impact=
+
+		# Get the commits for the author over the specified time period. Once
+		# we have the commits, we add up the number of lines inserted and
+		# deleted to get total aggregate displacement. In other words, we're not
+		# looking at net work performed; we're looking at gross cost (or
+		# displacement, irrespective of potential).
+		#
+		# Once we have that, we multiply it by the number of files changed to
+		# get the total area of impact. Once we have that, we divide by the
+		# total number of files in the tree snapshotted by this commit. This
+		# gives us a rate whose units are
+		#
+		#    lines displaced * files changed / files tracked
+		#
+		# This should mostly normalize cases with lots of change in a small
+		# number of files and little change in lots of files.
+		#
+		# We intentionally avoid doing something like using the total number of
+		# lines across all files during normalization. In theory, that would be
+		# a lot more elegant, since you could calculate area of impact and then
+		# normalize it against total area of potential impact. But we consider
+		# both additions and removals to be equally relevant, which would mean
+		# that the total potential area of impact is basically infinite. (Since
+		# in order to arrive at the current snapshot, you could've deleted any
+		# number of lines of code and then added the number of lines that
+		# actually exists.)
+		commits=$(Git.run log \
+				--no-merges \
+				--format=format:'COMMIT: %H' \
+				--author="$au" \
+				--numstat \
+				--since "$d" "$@")
+
+		# Add a trailing new line in case there is only a single commit, in
+		# which case our logic to tally the statistics of the commit wouldn't be
+		# invoked. If the author had no commits for the given tree, then we just
+		# won't do anything. Note that the IFS change only applies to the read
+		# command, not to the loop itself.
+		commits+=$'\n'
+		while IFS= read -r l; do
+			# Look for our commit marker to indicate we've begun processing a
+			# new commit. If we have, then we have to finalize our displacement
+			# area calculation. Otherwise, just continue aggregating the number
+			# of line displacements.
+			if [[ "$l" =~ ^COMMIT: ]]; then
+				commit_cur="$(strip_prefix "$l" "COMMIT: ")"
+			elif [[ ! "$l" =~ ^[[:space:]]*$ ]]; then
+				local stats=()
+				local inserted=
+				local deleted=
+
+				# We've hit line displacement statistics, so aggregate them.
+				stats=($l)
+				inserted=${stats[0]}
+				deleted=${stats[1]}
+
+				(( l_insert += inserted ))
+				(( l_delete += deleted ))
+				(( f_change += 1 ))
+			elif [ -n "$commit_cur" ]; then
+				# We've hit the new line separator between records, so tally up
+				# our commit statistics. Note that we can get here without a
+				# current commit if the author had no commits for the specified
+				# branch in the tree.
+				local tree=
+				local n_files=0
+				local displacement=0
+				local displacement_area=0
+				local impact_rate=0
+
+				tree=$(Git.run ls-tree -r $commit_cur)
+				n_files=$(echo "$tree"| wc -l | tr -d ' ')
+				displacement=$(( l_insert + l_delete ))
+				displacement_area=$(( displacement * f_change ))
+
+				# Multiply by a constant factor so that we don't have to
+				# worry too much about the lack of floating point precision.
+				(( displacement_area *= G_LOCFACTOR ))
+				impact_rate=$(( displacement_area / n_files ))
+				impact_series+=($impact_rate)
+
+				CLI.debug "$commit_cur"
+				CLI.debug "  author: $au"
+				CLI.debug "  displacement: $displacement"
+				CLI.debug "  factor: $G_LOCFACTOR"
+				CLI.debug "  files changed: $f_change"
+				CLI.debug "  files tracked: $n_files"
+				CLI.debug "  impact rate: $impact_rate"
+
+				# Record totals for author.
+				(( t_insert += l_insert ))
+				(( t_delete += l_delete ))
+
+				# Re-initialize our tracking fields.
+				f_change=0
+				l_insert=0
+				l_delete=0
+			fi
+		done <<< "$commits"
+
+		# Now that we have our series of impact rates for this author, calculate
+		# their mean impact area per files tracked. Within the series, we want
+		# to exclude outliers so that we're not thrown off by one or two large
+		# commits from an author.
+		Statistics.init_excluded "${impact_series[@]}"
+		impact=$(Statistics.mean)
+
+		authors_impacts+=($impact)
+		CLI.status "author: $au"
+		CLI.status "  total lines added: $t_insert"
+		CLI.status "  total lines removed: $t_delete"
+		CLI.status "  impact area / files tracked: $impact"
+	done
+
+	# Now find the mean and standard deviation for author impact scores.
+	Statistics.init "${authors_impacts[@]}"
+	mean=$(Statistics.mean)
+	stddev=$(Statistics.standard_deviation)
+
+	# Calculate the lower boundary for a potential owner.
+	boundary=$(( mean + (stddev * O_STDDEVS) ))
+	if [ $boundary -eq 0 ]; then
+		# We probably couldn't find any commits for this file in the specified
+		# timeframe, so just bump the boundary to screen out all potential
+		# owners.
+		boundary=1
+	fi
+
+	CLI.debug "author impacts"
+	CLI.debug "  mean: $mean"
+	CLI.debug "  standard deviation: $stddev"
+	CLI.debug "  lower boundary: $boundary"
+
+	# Now find potential owners.
+	for (( i = 0; i < ${#authors[@]}; i++ )); do
+		local au=${authors[$i]}
+		local impact=${authors_impacts[$i]}
+
+		if [ $impact -ge $boundary ]; then
+			CLI.debug "identified potential owner:" \
+					"name = $au, impact = $impact"
+			perps+=("$au")
+		fi
+	done
+
+	if [ ${#perps[@]} -eq 0 ]; then
+		perps+=("<none>")
+	fi
+
+	paths=$(joinby ", " "$@")
+	echo "$paths"
+
+	for pc in "${perps[@]}"; do
+		echo "   $pc"
+	done
+}
+
+# MARK: Command Implementation
+function __cmd()
+{
+	local magic="$1"
+	local which="$O_STRATEGY"
+	local d_target=
+
+	d_target=$(CLI.command date -v -${O_YEARS}y)
+	if [ $# -eq 0 ]; then
+		set -- "."
+	elif [ "$magic" = '@TRACKED' ]; then
+		set -- $(Git.run ls-tree --name-only HEAD)
+	fi
+
+	if [ -z "$O_SHORTLOG_PATHS" ]; then
+		for p in "$@"; do
+			$which "$d_target" "$p"
+		done
+	else
+		$which "$d_target" "$@"
+	fi
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+	local strategy=commits
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+
+		case "$1" in
+		-t | --timeframe=*)
+			O_YEARS="$arg"
+			shift
+			;;
+		-s | --standard-deviations=*)
+			O_STDDEVS="$arg"
+			shift
+			;;
+		-l | --shortlog-paths)
+			O_SHORTLOG_PATHS=t
+			shift
+			;;
+		-S | --strategy=*)
+			strategy="$arg"
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	case "$strategy" in
+	commits|lines)
+		O_STRATEGY="ownership_strategy_${strategy}"
+		;;
+	*)
+		CLI.die_badopt "$strategy" "ownership strategy"
+		;;
+	esac
+
+	__cmd "$@"
+}
+
+__main "$@"

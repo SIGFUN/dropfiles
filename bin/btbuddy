@@ -1,0 +1,249 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Plist.sh"
+
+# Parsed options
+GIT_PARSEOPT_SPEC="\
+btbuddy [-m MAC-ADDRESS | -n NAME]
+
+Unpairs and re-pairs Bluetooth devices by MAC-ADDRESS or NAME. PIN codes are \
+assumed to be 0000 unless specified globally or for a given device.
+
+The BTBUDDY_DEVICE_NAMES environment variable may be set to a comma-delimited \
+list of NAME:PIN entries. When run with no arguments, btbuddy will consult \
+this environment variable as though its entries were given to the n,name \
+option.
+
+$(CLI.get_stuckopt_blurb)
+--
+ Available options
+m,mac-address=MAC-ADDRESS[:PIN]  Unpairs and re-pairs the device identified by \
+MAC-ADDRESS. If PIN is specified, it is used for pairing, otherwise the \
+default PIN is used
+
+n,name=NAME[:PIN]                Unpairs and re-pairs the device identified by \
+NAME. If PIN is specified, it is used for pairing, otherwise the default PIN \
+is used
+
+p,pin=PIN                        Sets the default PIN to use for pairing \
+operations
+
+N,connection-attempts=N-ATTEMPTS Try N-ATTEMPTS times after re-pairing to \
+connect to the device. Sometimes multiple attempts are needed, even if the \
+first one appears to succeed
+
+$(CLI.get_global_blurb)
+"
+
+O_ADDRESSES=()
+O_NAMES=()
+O_DEFAULT_PIN="0000"
+O_CONNECTION_ATTEMPTS=5
+
+# MARK: Utilities
+function normalize_mac_address()
+{
+	local v="$1"
+	local n=
+
+	n=$(tolower "$v")
+	n=$(tr -d '-' <<< "$n")
+
+	if [[ "$n" =~ [a-f0-9] ]]; then
+		if [ ${#n} -eq 12 ]; then
+			echo "$n"
+		fi
+	fi
+}
+
+function blueutil_cmd()
+{
+	if [ $(CLI.get_verbosity) -gt 0 ]; then
+		CLI.command blueutil "$@"
+	else
+		q2 CLI.command blueutil "$@"
+	fi
+}
+
+function repair_bluetooth_device()
+{
+	local id="$1"
+	local pin="$2"
+	local out=
+	local ret=
+	local i=0
+
+	out=$(blueutil_cmd --unpair "$id")
+	ret=$?
+	case "$out" in
+	'Device not found')
+		# Not a big deal, just move on.
+		;;
+	*)
+		CLI.die_check "$ret" "unpair device: $id"
+	esac
+
+	q blueutil_cmd --inquiry 5
+	CLI.die_check $? "perform inquiry"
+
+	blueutil_cmd --pair "$id" "$pin"
+	CLI.die_check $? "pair device: $id"
+
+	for (( i = 0; i < $O_CONNECTION_ATTEMPTS; i++ )); do
+		local js=
+		local v=
+		local j=
+
+		blueutil_cmd --connect "$id"
+		CLI.die_check $? "connect to device: $id"
+
+		js=$(blueutil_cmd --format json --info "$id")
+		CLI.die_ifz "$js" "failed to get connected devices"
+
+		Plist.init_with_raw "json" "$js"
+		v=$(Plist.get_value "connected" "bool" "false")
+		if [ "$v" = "true" ]; then
+			break
+		fi
+	done
+}
+
+# MARK: Command Implementation
+function __cmd()
+{
+	local i=0
+
+	for (( i = 0; i < ${#O_ADDRESSES[@]}; i += 2 )); do
+		local id=${O_ADDRESSES[$(( $i + 0 ))]}
+		local pin=${O_ADDRESSES[$(( $i + 1 ))]}
+
+		if [ "$pin" = '%DEFAULT%' ]; then
+			pin="$O_DEFAULT_PIN"
+		fi
+
+		repair_bluetooth_device "$id" "$pin"
+	done
+
+	for (( i = 0; i < ${#O_NAMES[@]}; i += 2 )); do
+		local id=${O_NAMES[$(( $i + 0 ))]}
+		local pin=${O_NAMES[$(( $i + 1 ))]}
+		local js=
+
+		if [ "$pin" = '%DEFAULT%' ]; then
+			pin="$O_DEFAULT_PIN"
+		fi
+
+		js=$(blueutil_cmd --format json --info "$id")
+		CLI.die_ifz "$js" "failed to get info for device: $d"
+
+		Plist.init_with_raw "json" "$js"
+		id=$(Plist.get_value "address" "string")
+		id=$(normalize_mac_address "$id")
+
+		repair_bluetooth_device "$id" "$pin"
+	done
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+	local blueutil_tool=$(which blueutil)
+	local names_env="$BTBUDDY_DEVICE_NAMES"
+	local n_devices=0
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+		local pin='%DEFAULT%'
+		local v=
+		local spec=()
+
+		case "$1" in
+		-m | --mac-address=*)
+			spec=($(CLI.split_specifier_nospace ":" "$arg"))
+			CLI.die_ifz "${spec[0]}" "invalid specifier: $arg"
+
+			v="${spec[0]}"
+			v=$(normalize_mac_address "$v")
+			CLI.die_ifz "$v" "invalid mac address: ${spec[0]}"
+
+			if [ "${#spec[@]}" -gt 1  ]; then
+				pin="${spec[1]}"
+			fi
+
+			O_ADDRESSES+=("${spec[0]}" "$pin")
+			names_env=
+			shift
+			;;
+		-n | --name=*)
+			spec=($(CLI.split_specifier_nospace ":" "$arg"))
+			CLI.die_ifz "${spec[0]}" "invalid specifier: $arg"
+
+			if [ "${#spec[@]}" -gt 1  ]; then
+				pin="${spec[1]}"
+			fi
+
+			O_NAMES+=("${spec[0]}" "$pin")
+			names_env=
+			shift
+			;;
+		-p | --pin=*)
+			O_DEFAULT_PIN="$arg"
+			shift
+			;;
+		-N | --connection-attempts=*)
+			O_CONNECTION_ATTEMPTS="$arg"
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	if [ -n "$names_env" ]; then
+		local arr=()
+
+		arr=($(CLI.split_specifier_nospace ',' "$names_env"))
+		for s in "${arr[@]}"; do
+			local spec=()
+
+			spec=($(CLI.split_specifier_nospace ":" "$s"))
+			if [ "${#spec[@]}" -gt 1  ]; then
+				pin="${spec[1]}"
+			fi
+
+			O_NAMES+=("${spec[0]}" "$pin")
+		done
+	fi
+
+	CLI.die_ifz "$blueutil_tool" "blueutil not installed"
+	__cmd "$@"
+}
+
+__main "$@"

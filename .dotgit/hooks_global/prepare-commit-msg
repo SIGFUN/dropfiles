@@ -1,0 +1,31 @@
+#!/bin/bash -O extglob
+
+function __hook()
+{
+	local msgfile="$1"
+	local commit_src="$2"
+	local sha1="$3"
+	local branch="$(git branch --show-current)"
+	local ticket_regex=$(git config fix.bug.regex)
+	local footer=$(git config fix.bug.trailer)
+	local ticket=
+	local js=
+	local ticket_prefix=
+
+	ticket=$(grep -oE "$ticket_regex" <<< "$branch")
+	if [ -z "$ticket" ]; then
+		# If we can't find a ticket in the branch name, just don't append the
+		# footer.
+		exit 0
+	fi
+
+	js=$(git bug -m BugPrefix 2>/dev/null)
+	if [ -n "$js" ]; then
+		ticket_prefix=$(plutil -extract "BugPrefix" "raw" - <<< "$js")
+	fi
+
+	git interpret-trailers --in-place --if-exists addIfDifferent \
+			--trailer "$footer=${ticket_prefix}${ticket}" "$msgfile"
+}
+
+__hook "$@"

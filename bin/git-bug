@@ -1,0 +1,288 @@
+#!/bin/bash -O extglob
+
+# Executable preamble
+mydir="$(dirname $0)"
+pushd "$mydir/.." > /dev/null; dotfiles="$(pwd)"; popd > /dev/null
+libdir="${dotfiles}/lib"
+
+# Imports
+. "${libdir}/Lib.sh"
+. "${libdir}/Module.sh"
+. "${libdir}/CLI.sh"
+. "${libdir}/Git.sh"
+. "${libdir}/Keychain.sh"
+. "${libdir}/Plist.sh"
+. "${libdir}/Bug.sh"
+
+# Usage
+GIT_PARSEOPT_SPEC="\
+git-bug [options] BUG
+
+Performs basic manipulations for bugs in a bug tracking system. This tool \
+provides a common protocol for interacting with disparate systems, and as a \
+result, it provides fairly basic functionality for manipulating a limited set \
+of fields associated with each bug (or ticket).
+
+Information about the bug tracking system is queried from the repository's \
+git-config(7), which should be configured for the appropriate employer via \
+'git fix -i'
+
+Supported bug fields are:
+
+Title        The title of the bug
+State        The lifecycle state of the bug
+Branch       The fix branch associated with the bug
+Component    The bug's component within its project
+
+The specific state from the bug tracker will be normalized to one of the \
+following values:
+
+new          The bug is awaiting triage, investigation, and prioritization
+scheduled    The bug has been scheduled and prioritized for a release
+active       The bug is being actively worked on
+review       The bug is being reviewed
+merged       The fix branch has been merged
+
+Information about the bug tracker itself may also be queried. Supported bug \
+tracker fields are:
+
+Key          The key corresponding to bugs tracked by the project associated \
+with the repository, usually used as a prefix on the bug number
+BugPrefix    The full prefix to prepend to an issue number to give it \
+contextual relevance in the bug tracker
+
+$(CLI.get_stuckopt_blurb)
+--
+ Mutually exclusive options
+u,update-field=FIELD:VALUE[:TYPE]  Updates BUG and sets FIELD to VALUE. \
+VALUE's type is a string by default, but an optional TYPE may be specified. \
+Supported types are 'bool', 'string', and 'number'. This option may be \
+specified multiple times
+
+q,query-bug=BUG-FIELD            Queries the value of BUG-FIELD for BUG. The \
+output is a JSON dictionary containing all requested fields and their values. \
+This option may be specified multiple times
+
+m,query-tracker=TRACKER-FIELD    Queries the value of TRACKER-FIELD for the \
+tracker. The output is a JSON dictionary containing all requested fields and \
+their values. This option may be specified multiple times
+
+$(CLI.get_global_blurb)
+"
+
+O_ACTION=
+O_UPDATE_FIELDS=()
+O_QUERY_FIELDS=()
+O_QUERY_TRACKER_FIELDS=()
+
+# MARK: Cleanup
+CL_BUG=
+
+# MARK: Utilities
+function validate_bool()
+{
+	local v=
+
+	case "$v" in
+	true|false|0|1)
+		;;
+	*)
+		CLI.die "Boolean must be either true or false: $v"
+		;;
+	esac
+}
+
+function validate_number()
+{
+	local v="$1"
+
+	if [ "$v" -ne "$v" ] 2>/dev/null; then
+		CLI.die "invalid number: $v"
+	fi
+}
+
+function validate_type()
+{
+	local t="$1"
+	local v="$2"
+
+	case "$t" in
+	bool)
+		validate_bool "$v"
+		;;
+	number)
+		validate_number "$v"
+		;;
+	string)
+		;;
+	*)
+		CLI.die "invalid type: $f"
+		;;
+	esac
+}
+
+# MARK: Command Implementation
+function __cleanup()
+{
+	if [ -n "$CL_BUG" ]; then
+		Bug.cleanup
+	fi
+}
+
+function __update()
+{
+	local i=0
+
+	Module.config 0 "update [$O_TRACKER]" "$O_NUMBER"
+	for (( i = 0; i < "${#O_UPDATE_FIELDS[@]}"; i += 3 )); do
+		local f="${O_UPDATE_FIELDS[$(( $i + 0 ))]}"
+		local v="${O_UPDATE_FIELDS[$(( $i + 1 ))]}"
+		local t="${O_UPDATE_FIELDS[$(( $i + 2 ))]}"
+
+		Module.config 1 "$f" "$v [$t]"
+		Bug.update_field "$f" "$v" "$t"
+	done
+
+	Bug.update
+	CLI.die_check $? "update bug"
+}
+
+function __query_bug()
+{
+	local jsr=
+
+	Module.config 0 "query [$O_TRACKER]" "$O_NUMBER"
+	for f in "${O_QUERY_FIELDS[@]}"; do
+		Module.config 1 "" "$f"
+		Bug.query_field "$f"
+	done
+
+	jsr=$(Bug.query)
+	CLI.die_check $? "query bug"
+
+	echo "$jsr"
+}
+
+function __query_tracker()
+{
+	Plist.init_with_raw "json" '{}'
+	Module.config 0 "tracker query"
+	for f in "${O_QUERY_TRACKER_FIELDS[@]}"; do
+		local v=
+
+		Module.config 1 "" "$f"
+		v=$(Bug.query_tracker_property "$f")
+		Plist.set_value "$f" "string" "$v"
+	done
+
+	Plist.get "json"
+}
+
+function __cmd()
+{
+	CLI.start_debug
+	Bug.init
+	CL_BUG=t
+
+	if [ -n "$O_NUMBER" ]; then
+		Bug.init_problem "$O_NUMBER"
+	fi
+
+	${O_ACTION} "$@"
+}
+
+function __main()
+{
+	local me="$(basename ${BASH_SOURCE[0]})"
+	local expect_bug=t
+
+	CLI.init "$me" "$GIT_PARSEOPT_SPEC" "$@"
+	eval "$(echo "$GIT_PARSEOPT_SPEC" |
+		git rev-parse --parseopt --keep-dashdash --stuck-long -- "$@" \
+				|| echo exit $?
+	)"
+
+	while [ $# -ne 0 ]; do
+		local arg="$(CLI.parse_argument "$1")"
+		local arg_opt=()
+		local ifs_old=$IFS
+		local spec=
+		local f=
+		local v=
+		local t="string"
+
+		case "$1" in
+		-u | --update-field=*)
+			# The Title field can contain spaces, so we have to split the update
+			# specifier ourselves inline, since it's extremely awkward to
+			# propagate an array from a subshell back up to the parent shell in
+			# bash. If we wanted to do that, we'd have to set the field
+			# separator to something other than a space anyway.
+			IFS=':'
+			spec=($arg)
+			IFS="$ifs_old"
+
+			if [ "${#spec[@]}" -lt 2 ]; then
+				CLI.die "invalid field update specifier: $arg"
+			fi
+
+			f="${spec[0]}"
+			v="${spec[1]}"
+			if [ "${#spec[@]}" -ge 3 ]; then
+				t="${spec[2]}"
+			fi
+
+			O_UPDATE_FIELDS+=("$f" "$v" "$t")
+			O_ACTION=__update
+			shift
+			;;
+		-q | --query-bug=*)
+			O_QUERY_FIELDS+=("$arg")
+			O_ACTION=__query_bug
+			shift
+			;;
+		-m | --query-tracker=*)
+			O_QUERY_TRACKER_FIELDS+=("$arg")
+			O_ACTION=__query_tracker
+			expect_bug=
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			# This was one of the common options that was already consumed by
+			# the CLI module. git-revparse will not have normalized an
+			# unrecognized option.
+			shift
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	if [ -n "$expect_bug" ]; then
+		if [ $# -lt 1 ]; then
+			CLI.die "please provide a bug number"
+		fi
+
+		O_NUMBER="$1"
+		shift
+	fi
+
+	CLI.die_ifz "$O_ACTION" "please specify an action"
+
+	Module.config 0 "git bug"
+	Module.config 1 "action" "$O_ACTION"
+	Module.config 1 "project" "$O_PROJECT"
+	Module.config 1 "tracker" "$O_TRACKER"
+	Module.config 1 "bug number" "$O_NUMBER"
+	Module.config 1 "username" "$O_USERNAME"
+
+	CLI.init_cleanup __cleanup
+	__cmd "$@"
+}
+
+__main "$@"
