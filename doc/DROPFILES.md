@@ -19,9 +19,11 @@ there are several descriptions of the workflow you can find online, e.g.
 or [this one](https://www.atlassian.com/git/tutorials/dotfiles). But the gist of
 how you'd use this workflow with `dropfiles` is...
 
-1. `git clone --bare $REPOSITORY_URL $HOME/.dotfiles`
-2. `git --git-dir=$HOME/.dotfiles --work-tree=$HOME checkout`
-3. `git --git-dir=$HOME/.dotfiles --work-tree=$HOME config status.showUntrackedFiles no`
+```
+$ git clone --bare $REPOSITORY_URL $HOME/.dotfiles
+$ git --git-dir=$HOME/.dotfiles --work-tree=$HOME checkout
+$ git --git-dir=$HOME/.dotfiles --work-tree=$HOME config status.showUntrackedFiles no
+```
 
 Tutorials will recommend creating an alias for the
 `git --git-dir=$HOME/.dotfiles --work-tree=$HOME` bits of these commands, and
@@ -39,13 +41,23 @@ it only cares about files. So you can have two repository working trees checked
 out at the same root provided they don't have any conflicting files, which these
 two repositories won't. So you can do...
 
-1. `git clone --bare $REPOSITORY_URL $HOME/.dotemployer`
-2. `git --git-dir=$HOME/.dotemployer --work-tree=$HOME checkout`
-3. `git --git-dir=$HOME/.dotemployer --work-tree=$HOME config status.showUntrackedFiles no`
+```
+$ git clone --bare $REPOSITORY_URL $HOME/.dotemployer
+$ git --git-dir=$HOME/.dotemployer --work-tree=$HOME checkout drops
+$ git --git-dir=$HOME/.dotemployer --work-tree=$HOME config status.showUntrackedFiles no
+```
+
+The employer dotfiles will probably have a `drops` branch that redacts certain
+content from those by just keeping a commit at the top of that branch to do the
+redaction. The reason we can do this for employer dotfiles is because they
+are entirely hosted by the employer, whereas personal dotfiles are hosted by me,
+and I don't want certain artifacts to reside on employer infrastructure that is
+subject to regular backups and such. (Residing on an employer-controlled
+endpoint is fine; it's just the cost of doing business.)
 
 ## Configuring `git-fix`
 The `git-fix` utility needs a bit of git configuration that you can provide by
-looking at ~/.dotgit/gitconfig_template` and filling in the relevant fields.
+looking at `~/.dotgit/gitconfig_template` and filling in the relevant fields.
 That file has comments describing each one's purpose.
 
 Once you do that, you should be good to go.

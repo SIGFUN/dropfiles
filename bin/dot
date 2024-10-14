@@ -253,7 +253,7 @@ function __drop()
 	Git.init_dotfiles
 
 	Git.check_tree_dirty
-	#CLI.die_check $? "please stash or commit changes before archiving"
+	CLI.die_check $? "please stash or commit changes before archiving"
 
 	head=$(Git.get_head_hash)
 	commitmsg="dotfiles drop"
