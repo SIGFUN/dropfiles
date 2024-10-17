@@ -339,6 +339,26 @@ function CLI.split_specifier_nospace()
 	echo "${arr[@]}"
 }
 
+function CLI.print_field()
+{
+	local lvl="$1"
+	local name="$2"
+	local width=30
+	local indent=""
+
+	shift 2
+	for (( l = 0; l < $lvl; l++ )); do
+		indent+=" "
+	done
+
+	name="$indent$name"
+	if [ $# -eq 0 ]; then
+		printf '%s\n' "$name"
+	else
+		printf '%-*s: %s\n' $width "$name" "$@"
+	fi
+}
+
 function CLI.status()
 {
 	local msg="$@"
