@@ -123,9 +123,9 @@ function Bytes.map()
 		CLI.die "out of bounds mapping: offset = $o, expected <= $F_BYTES_LEN"
 	fi
 
-	# If the caller gives zero for the length, then just map from the given
-	# offset to the end.
-	if [ $l -eq 0 ]; then
+	# If the caller gives -1 for the length, then just map from the given offset
+	# to the end.
+	if [ $l -eq -1 ]; then
 		l=$(( F_BYTES_LEN - o ))
 	fi
 
@@ -144,7 +144,6 @@ function Bytes.map()
 function Bytes.read()
 {
 	local n="$1"
-	local f="$2"
 
 	CLI.debug "reading: cursor = $F_BYTES_CURSOR, nbytes = $n"
 	Bytes._read "$n"
@@ -154,20 +153,51 @@ function Bytes.check_read()
 {
 	local s="$1"
 	local what="$2"
-	local l=${#s}
+	local l_expect="$3"
+	local l_actual=${#s}
 
-	l=$(( l / 2 ))
-	Bytes.check_read_length "$s" "$what" "$l"
+	l_actual=$(( l_actual / 2 ))
+	if [ $l_actual -ne $l_expect ]; then
+		CLI.die "failed to read $what: actual = $l_actual, expected = $l_expect"
+	fi
+
+	Bytes.seek "current" "$l_actual"
 }
 
-function Bytes.check_read_length()
+function Bytes.check_read_bytes()
 {
-	local v="$1"
+	local s="$1"
 	local what="$2"
-	local l="$3"
+	local l_expect=0
+	local l_actual=${#s}
 
-	CLI.die_ifz "$v" "failed to read: $what"
-	Bytes.seek "current" "$l"
+	l_actual=$(( l_actual / 2 ))
+	if [ $l_actual -le $l_expect ]; then
+		CLI.die "failed to read $what: actual = $l_actual, expected > $l_expect"
+	fi
+
+	Bytes.seek "current" "$l_actual"
+}
+
+function Bytes.check_read_integer()
+{
+	local s="$1"
+	local what="$2"
+	local l_read="$3"
+	local l_expect=0
+	local l_actual=${#s}
+
+	if [ $l_actual -le $l_expect ]; then
+		CLI.die "failed to read $what: actual = $l_actual, expected > $l_expect"
+	fi
+
+	CLI.debug "read integer: $what = $s"
+	Bytes.seek "current" "$l_read"
+}
+
+function Bytes.getpos()
+{
+	echo "$F_BYTES_CURSOR"
 }
 
 function Bytes.seek()
