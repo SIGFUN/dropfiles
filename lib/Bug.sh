@@ -76,8 +76,8 @@ function Bug.init()
 	F_BUG_PROJECT="$(Git.run config fix.bug.project)"
 	CLI.die_ifz "$F_BUG_PROJECT" "no bug tracker project name configured"
 
-	F_BUG_USERNAME="$(Git.run config fix.bug.account)"
-	CLI.die_ifz "$F_BUG_USERNAME" "no bug tracker account configured"
+	F_BUG_USERNAME="$(Git.run config fix.bug.username)"
+	CLI.die_ifz "$F_BUG_USERNAME" "no bug tracker username configured"
 
 	F_BUG_SECRETS="$(CLI.get_run_state_path "secrets")"
 	CLI.command mkdir -p "$F_BUG_SECRETS"

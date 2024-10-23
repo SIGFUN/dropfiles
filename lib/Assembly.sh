@@ -374,7 +374,7 @@ function Assembly._create_workspace()
 		fi
 
 		cd "$p"
-		Git.init
+		Git.init "default" "default" "default"
 		Git.run reset --hard '%REMOTE%'
 		CLI.die_check $? "reset repo to clean state: $p"
 

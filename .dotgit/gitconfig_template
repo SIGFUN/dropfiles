@@ -1,37 +1,89 @@
+# @brief
 # This is a template for use by external consumers of `dotfiles` in helping
 # others create the right configuration file for use by `git-fix`. You can fill
 # out this template and save the result to `~/.dotgit/gitconfig_company`, which
 # will let you do `git fix --init company`.
+
+# @section user
+# Parameters describing the commit author.
+#
+# @field name
+# Your full name.
+#
+# @email
+# Your email address.
 [user]
 	name = Your Name
 	email = you@domain.com
 
-# General parameters for `git-fix`.
+# @section fix
+# General parameters for git-fix.
+#
+# @field username
+# Your canonical username in the organization. This username will appear in the
+# branches that git-fix creates. if your organization uses different systems for
+# bug tracking and git repository hosting, you can specify those in the fix.bug
+# and fix.pr sections, respectively.
 [fix]
 	username = your_username
 
+# @section fix.wip
 # Configuration parameters for work-in-progress or development git branches.
 # This can either be your personal preference or something required by your
 # organization.
+#
+# @field namespace
+# The namespace in which development branches should be created.
 [fix "wip"]
 	namespace = wip
 
-# Configuration parameters for git branches intended to be put up in PRs and
-# merged. This can either by your personal preference or something required by
-# your organization. This lets you specify a username for the PR back-end (e.g.
-# GitHub) that is independent of your employer's username.
+# @section fix.pr
+# Configuration parameters for interacting with the repository host which
+# manages merges/pull requests.
+#
+# @field backend
+# The name of the PR module to use.
+#
+# @field organization
+# If required (e.g. by GitHub or another hosted service), your organization's
+# name in the repository host.
+#
+# @field username
+# Your username in the repository host.
+#
+# @field namespace
+# The namespace in which branches should be created once they are ready for
+# review and a pull request or merge.
 [fix "pr"]
 	backend = GitHub
 	organization = Unlicensed Nuclear Accelerator, LLC
 	username = your_username_for_the_back_end
 	namespace = PR
 
+# @section fix.bug
 # Configuration parameters for interacting with bug trackers. The project
-# includes a very dumb "Local" bug tracker, mainly for testing. The `regex`
-# parameter specifies how to find bug identifiers in text. The `trailer`
-# parameter is the name of the trailer field that will be attached to commit
-# messages. This can eithe
+# includes a very dumb "Local" bug tracker, mainly for testing.
+#
+# @field tracker
+# The name of the tracker module to use.
+#
+# @field urlFormat
+# The format string describing URLs in the bug tracker. The URL can expand two
+# variables, NUMBER and PREFIX. Refer to variables by enclosing them in '%'
+# characters, e.g. '%NUMBER%'.
+#
+# @field account
+# Your account name in the bug tracker.
+#
+# @field regex
+# The regex that can be used to identify numbers from the bug tracker.
+#
+# @field trailer
+# The name of the trailer field that should be attached to commit messages when
+# fixing a bug.
 [fix "bug"]
 	tracker = Local
+	urlFormat = file://%NUMBER%
+	username = your_username_for_the_bug_tracker
 	regex = [0-9]{4,}
 	trailer = Bug-Id
